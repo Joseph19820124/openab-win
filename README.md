@@ -130,7 +130,7 @@ allowed_channels = ["C0123456789"]   # channel ID allowlist (empty = allow all)
 [agent]
 command = "kiro-cli"                  # CLI command
 args = ["acp", "--trust-all-tools"]   # ACP mode args
-working_dir = "/tmp"                  # agent working directory
+working_dir = "."                     # agent working directory (cross-platform local default)
 env = {}                              # extra env vars passed to the agent
 
 [pool]

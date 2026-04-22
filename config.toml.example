@@ -31,30 +31,30 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 [agent]
 command = "kiro-cli"
 args = ["acp", "--trust-all-tools"]
-working_dir = "/home/agent"
+working_dir = "."  # use local project dir; set "/home/agent" in containers
 
 # [agent]
 # command = "claude"
 # args = ["--acp"]
-# working_dir = "/home/agent"
+# working_dir = "."
 # env = { ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}" }
 
 # [agent]
 # command = "codex"
 # args = ["--acp"]
-# working_dir = "/home/agent"
+# working_dir = "."
 # env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
 
 # [agent]
 # command = "gemini"
 # args = ["--acp"]
-# working_dir = "/home/agent"
+# working_dir = "."
 # env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
 
 # [agent]
 # command = "copilot"
 # args = ["--acp", "--stdio"]
-# working_dir = "/home/agent"
+# working_dir = "."
 # env = {}  # Auth via: kubectl exec -it <pod> -- gh auth login -p https -w
 
 # [agent]
@@ -68,8 +68,8 @@ working_dir = "/home/agent"
 
 # [agent]
 # command = "cursor-agent"
-# args = ["acp", "--model", "auto", "--workspace", "/home/agent"]
-# working_dir = "/home/agent"
+# args = ["acp", "--model", "auto", "--workspace", "."]
+# working_dir = "."
 # env = {}  # Auth via: kubectl exec -it <pod> -- cursor-agent login
 
 [pool]

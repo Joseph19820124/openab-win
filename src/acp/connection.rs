@@ -107,7 +107,7 @@ impl ContentBlock {
 
 pub struct AcpConnection {
     _proc: Child,
-    /// PID of the direct child, used as the process group ID for cleanup.
+    /// PID of the direct child, used as the process group ID on Unix.
     child_pgid: Option<i32>,
     stdin: Arc<Mutex<ChildStdin>>,
     next_id: AtomicU64,
@@ -136,17 +136,27 @@ impl AcpConnection {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .current_dir(working_dir);
-        // Create a new process group so we can kill the entire tree.
-        // SAFETY: setpgid is async-signal-safe (POSIX.1-2008) and called
-        // before exec. Return value checked — failure means the child won't
-        // have its own process group, so kill(-pgid) would be unsafe.
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+        #[cfg(unix)]
+        {
+            // Create a new process group so we can kill the entire tree.
+            // SAFETY: setpgid is async-signal-safe (POSIX.1-2008) and called
+            // before exec. Return value checked — failure means the child won't
+            // have its own process group, so kill(-pgid) would be unsafe.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setpgid(0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        #[cfg(windows)]
+        {
+            // Isolate the child in its own process group to avoid inheriting
+            // console control events from the parent process.
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
         }
         for (k, v) in env {
             cmd.env(k, expand_env(v));
@@ -154,8 +164,16 @@ impl AcpConnection {
         let mut proc = cmd
             .spawn()
             .map_err(|e| anyhow!("failed to spawn {command}: {e}"))?;
-        let child_pgid = proc.id()
-            .and_then(|pid| i32::try_from(pid).ok());
+        let child_pgid = {
+            #[cfg(unix)]
+            {
+                proc.id().and_then(|pid| i32::try_from(pid).ok())
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        };
 
         let stdout = proc.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let stdin = proc.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
@@ -492,21 +510,31 @@ impl AcpConnection {
         Ok(())
     }
 
-    /// Kill the entire process group: SIGTERM → SIGKILL.
-    /// Uses std::thread (not tokio::spawn) so SIGKILL fires even during
-    /// runtime shutdown or panic unwinding.
+    /// Kill the child process (and tree on Unix) during shutdown.
     fn kill_process_group(&mut self) {
-        let pgid = match self.child_pgid {
-            Some(pid) if pid > 0 => pid,
-            _ => return,
-        };
-        // Stage 1: SIGTERM the process group
-        unsafe { libc::kill(-pgid, libc::SIGTERM); }
-        // Stage 2: SIGKILL after brief grace (std::thread survives runtime shutdown)
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(1500));
-            unsafe { libc::kill(-pgid, libc::SIGKILL); }
-        });
+        #[cfg(unix)]
+        {
+            let pgid = match self.child_pgid {
+                Some(pid) if pid > 0 => pid,
+                _ => {
+                    let _ = self._proc.start_kill();
+                    return;
+                }
+            };
+            // Stage 1: SIGTERM the process group
+            unsafe { libc::kill(-pgid, libc::SIGTERM); }
+            // Stage 2: SIGKILL after brief grace (std::thread survives runtime shutdown)
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                unsafe { libc::kill(-pgid, libc::SIGKILL); }
+            });
+        }
+        #[cfg(not(unix))]
+        {
+            if let Err(err) = self._proc.start_kill() {
+                debug!(error = %err, "failed to terminate child process");
+            }
+        }
     }
 }
 
