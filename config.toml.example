@@ -77,9 +77,9 @@ working_dir = "."  # use local project dir; set "/home/agent" in containers
 # (EC2 provisioning, SSH ControlMaster multiplexing, auth).
 # [agent]
 # command = "ssh"
-# args = ["-tt", "tokyo-agent", "codex-acp"]   # Host alias from ~/.ssh/config
+# args = ["-tt", "tokyo-agent", "gemini", "--acp"]  # Host alias from ~/.ssh/config
 # working_dir = "."
-# env = {}  # Set OPENAI_API_KEY in the remote ~/.bashrc, not here
+# env = {}  # Set GEMINI_API_KEY in the remote ~/.bashrc, not here
 
 [pool]
 max_sessions = 10
