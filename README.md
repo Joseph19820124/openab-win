@@ -151,6 +151,17 @@ as `openab-<tag>-<target>.zip`.
 > Windows host. This fork only ships `openab.exe` — it does not bundle the
 > downstream agent binaries the upstream Docker images do.
 
+### Remote agent over SSH
+
+If you'd rather keep your laptop lean and run the agent CLI on EC2 (or any
+SSH host), `openab` can spawn `ssh` as its child process and tunnel the
+stdio JSON-RPC stream — no code changes needed. Typical topology: Mac
+for development, Windows for production, both clients pointing at a
+shared Tokyo EC2 running `codex-acp`. See
+[docs/remote-agent-ssh.md](docs/remote-agent-ssh.md) for the full
+walkthrough (EC2 setup, `~/.ssh/config`, `config.toml` example,
+latency expectations, troubleshooting).
+
 ## Configuration Reference
 
 ```toml

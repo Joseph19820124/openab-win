@@ -72,6 +72,15 @@ working_dir = "."  # use local project dir; set "/home/agent" in containers
 # working_dir = "."
 # env = {}  # Auth via: kubectl exec -it <pod> -- cursor-agent login
 
+# Remote agent via SSH — run the ACP agent on EC2 (or any SSH host)
+# instead of locally. See docs/remote-agent-ssh.md for the full setup
+# (EC2 provisioning, SSH ControlMaster multiplexing, auth).
+# [agent]
+# command = "ssh"
+# args = ["-tt", "tokyo-agent", "codex-acp"]   # Host alias from ~/.ssh/config
+# working_dir = "."
+# env = {}  # Set OPENAI_API_KEY in the remote ~/.bashrc, not here
+
 [pool]
 max_sessions = 10
 session_ttl_hours = 24
