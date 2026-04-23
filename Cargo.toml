@@ -11,7 +11,7 @@ serde_json = "1"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend", "cache"] }
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "native_tls_backend", "cache"] }
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
 anyhow = "1"
@@ -20,11 +20,11 @@ futures-util = "0.3"
 rand = "0.8"
 clap = { version = "4", features = ["derive"] }
 rpassword = "7"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "multipart", "json", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "multipart", "json", "blocking"] }
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 unicode-width = "0.2"
-tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

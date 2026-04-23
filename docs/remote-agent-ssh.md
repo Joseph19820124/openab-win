@@ -159,11 +159,13 @@ Edit `config.toml`:
 ```toml
 [agent]
 # Instead of running a local binary, spawn ssh and let it invoke the
-# agent on the remote host. -tt forces a PTY, which many ACP adapters
-# expect for well-behaved stdin buffering.
+# agent on the remote host. Use `-T` (NOT `-tt`): ACP is a JSON-RPC
+# protocol over raw stdio, and a PTY would put stdin in canonical mode
+# with echo + line buffering, corrupting the byte stream and hanging the
+# initialize handshake.
 command = "ssh"
 args = [
-    "-tt",
+    "-T",
     "tokyo-agent",
     # The remote command — `gemini --acp` starts ACP mode.
     # Ensure GEMINI_API_KEY is set in ~/.bashrc on the remote so a
@@ -179,7 +181,7 @@ working_dir = "."
 env = {}
 ```
 
-Restart `openab`; it will spawn `ssh -tt tokyo-agent gemini --acp` as
+Restart `openab`; it will spawn `ssh -T tokyo-agent gemini --acp` as
 its child process, and the existing stdio JSON-RPC code talks to
 `gemini` unchanged.
 
@@ -234,9 +236,11 @@ Mitigations until the upstream fix lands:
 
 | Symptom | Cause / Fix |
 |---|---|
-| `gemini: command not found` | npm global bin not on login-shell PATH. `-tt` forces a login shell which should fix it; otherwise use absolute path `/usr/bin/gemini` or check `ssh tokyo-agent 'which gemini'`. |
+| `gemini: command not found` | npm global bin not on remote non-login `PATH`. Fix by either using the absolute path (`args = ["-T", "tokyo-agent", "/usr/bin/gemini", "--acp"]`) or exporting `PATH` in the remote `~/.bashrc` so it applies to non-interactive SSH sessions. |
+| `initialize` hangs forever, no JSON response over SSH | You used `-tt` instead of `-T`. `-tt` allocates a PTY, which puts stdin in canonical mode and breaks the JSON-RPC stream. Use `-T`. |
 | Immediate hangup after `session/new` | Missing `GEMINI_API_KEY` on remote. `ssh tokyo-agent 'env \| grep GEMINI'` should show the key. |
 | `failed to parse message` spam in openab logs | Known gemini-cli stdout pollution — see "Known issue" above. Switch to API key auth and/or upgrade the CLI. |
 | Session crashes right after spawn | Often a Node version mismatch — gemini-cli needs Node ≥20. `ssh tokyo-agent node --version`. |
 | 500 ms+ added to every message | ControlMaster not reused. After the first `ssh` run, `ls ~/.ssh/cm-*` should show a socket; if empty, OpenSSH client is too old (<7.4) or the `ControlPath` directory is not writable. |
 | 429 rate-limit errors | The free Gemini tier is generous but bursty — either throttle `pool.max_sessions` in `config.toml` or move to a billed Google Cloud project. |
+| Discord bot stays offline, logs show `Err starting shard 0: ... InvalidCertificate(UnknownIssuer)` | You are behind a corporate TLS-intercepting gateway (e.g. Zscaler). The interceptor swaps Discord's cert for one signed by a private enterprise CA that is installed in the OS keychain but NOT in rustls's bundled `webpki-roots`. **Fix already applied** to `Cargo.toml`: all three TLS consumers (`serenity`, `reqwest`, `tokio-tungstenite`) are built with `native-tls` / `native_tls_backend`, which reads the OS trust store (macOS keychain, Windows cert store, Linux `/etc/ssl/certs`). If you ever switch back to `rustls_backend` you will hit this again on corp networks. |
