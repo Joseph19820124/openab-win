@@ -1,4 +1,10 @@
-# OpenAB — Open Agent Broker
+# OpenAB-Win — Windows-native fork of OpenAB
+
+> This is a **Windows-focused fork** of [openabdev/openab](https://github.com/openabdev/openab).
+> The upstream project targets Linux containers; this fork ships native Windows
+> binaries (`openab.exe`) and documents a Windows-first local workflow.
+> Rust sources remain fully cross-platform — upstream changes can still be
+> merged via the `upstream` remote.
 
 [![Stars](https://img.shields.io/github/stars/openabdev/openab?style=flat-square)](https://github.com/openabdev/openab) [![GitHub Release](https://img.shields.io/github/v/release/openabdev/openab?style=flat-square&logo=github)](https://github.com/openabdev/openab/releases/latest) ![License](https://img.shields.io/badge/license-MIT-A374ED?style=flat-square)
 
@@ -105,6 +111,8 @@ The bot creates a thread. After that, just type in the thread — no @mention ne
 
 ## Local Development
 
+### Linux / macOS
+
 ```bash
 cp config.toml.example config.toml
 # Edit config.toml with your bot token and channel ID
@@ -112,6 +120,36 @@ cp config.toml.example config.toml
 export DISCORD_BOT_TOKEN="your-token"
 cargo run
 ```
+
+### Windows (PowerShell)
+
+Prerequisite: [Rust toolchain](https://rustup.rs/) (MSVC target — the default on Windows).
+
+```powershell
+Copy-Item config.toml.example config.toml
+# Edit config.toml with your bot token and channel ID
+
+$env:DISCORD_BOT_TOKEN = "your-token"
+cargo run --release
+```
+
+To produce a standalone `openab.exe`:
+
+```powershell
+cargo build --release
+# binary: target\release\openab.exe
+
+.\target\release\openab.exe run .\config.toml
+```
+
+Pre-built Windows binaries (x64 and ARM64) are published as GitHub Actions
+artifacts by the `Build (Windows)` workflow and attached to tagged releases
+as `openab-<tag>-<target>.zip`.
+
+> **Note:** The agent CLI you point `[agent].command` at (e.g. `kiro-cli`,
+> `claude`, `codex`, `gemini`) must itself be installed and on `PATH` on the
+> Windows host. This fork only ships `openab.exe` — it does not bundle the
+> downstream agent binaries the upstream Docker images do.
 
 ## Configuration Reference
 
