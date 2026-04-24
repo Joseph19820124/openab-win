@@ -1,6 +1,7 @@
 use crate::acp::ContentBlock;
 use crate::acp::protocol::ConfigOption;
 use crate::adapter::{AdapterRouter, ChatAdapter, ChannelRef, MessageRef, SenderContext};
+use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::format;
 use crate::media;
@@ -9,7 +10,7 @@ use std::sync::LazyLock;
 use serenity::builder::{CreateActionRow, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage};
 use serenity::http::Http;
 use serenity::model::application::{ComponentInteractionDataKind, Interaction};
-use serenity::model::channel::{AutoArchiveDuration, ChannelType, Message, MessageType, ReactionType};
+use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, ReactionType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
@@ -20,9 +21,6 @@ use tracing::{debug, error, info};
 /// Hard cap on consecutive bot messages in a channel or thread.
 /// Prevents runaway loops between multiple bots in "all" mode.
 const MAX_CONSECUTIVE_BOT_TURNS: u8 = 10;
-
-/// Absolute per-thread cap on bot turns. Cannot be overridden by config or human intervention.
-const HARD_BOT_TURN_LIMIT: u32 = 100;
 
 /// Maximum entries in the participation cache before eviction.
 const PARTICIPATION_CACHE_MAX: usize = 1000;
@@ -71,8 +69,8 @@ impl ChatAdapter for DiscordAdapter {
         Ok(())
     }
 
-    fn use_streaming(&self) -> bool {
-        true
+    fn use_streaming(&self, other_bot_present: bool) -> bool {
+        !other_bot_present
     }
 
     async fn create_thread(
@@ -261,30 +259,54 @@ impl EventHandler for Handler {
             let thread_key = msg.channel_id.to_string();
             let mut tracker = self.bot_turns.lock().await;
             if msg.author.bot {
-                match tracker.on_bot_message(&thread_key) {
-                    TurnResult::HardLimit => {
-                        tracing::warn!(channel_id = %msg.channel_id, "hard bot turn limit reached");
-                        if msg.author.id != bot_id {
-                            let _ = msg.channel_id.say(
-                                &ctx.http,
-                                format!("🛑 Hard bot turn limit reached ({HARD_BOT_TURN_LIMIT}). A human must reply to continue."),
-                            ).await;
+                match tracker.classify_bot_message(&thread_key) {
+                    TurnAction::Continue => {}
+                    TurnAction::SilentStop => return,
+                    TurnAction::WarnAndStop { severity, turns, user_message } => {
+                        match severity {
+                            TurnSeverity::Hard => tracing::warn!(
+                                channel_id = %msg.channel_id,
+                                turns,
+                                "hard bot turn limit reached",
+                            ),
+                            TurnSeverity::Soft => tracing::info!(
+                                channel_id = %msg.channel_id,
+                                turns,
+                                max = self.max_bot_turns,
+                                "soft bot turn limit reached",
+                            ),
+                        }
+                        // Only post the warning if this bot is allowed in the channel/thread.
+                        // Bot turn counting intentionally runs before channel gating so ALL
+                        // bot messages are counted, but the *warning message* must respect
+                        // channel permissions — otherwise bots that never participated in a
+                        // thread will spam it with warnings.
+                        //
+                        // Must match the full thread allowlist semantics: a thread is allowed
+                        // if its own channel_id OR its parent_id is in allowed_channels.
+                        let ch = msg.channel_id.get();
+                        let mut allowed_here = self.allow_all_channels
+                            || self.allowed_channels.contains(&ch);
+                        if !allowed_here {
+                            // Thread channel_id won't be in allowed_channels directly —
+                            // check parent_id via to_channel(). Only called on the
+                            // WarnAndStop path (once per soft/hard limit hit), not on
+                            // every bot message.
+                            if let Ok(serenity::model::channel::Channel::Guild(gc)) =
+                                msg.channel_id.to_channel(&ctx.http).await
+                            {
+                                if gc.parent_id.is_some_and(|pid| {
+                                    self.allowed_channels.contains(&pid.get())
+                                }) {
+                                    allowed_here = true;
+                                }
+                            }
+                        }
+                        if msg.author.id != bot_id && allowed_here {
+                            let _ = msg.channel_id.say(&ctx.http, &user_message).await;
                         }
                         return;
                     }
-                    TurnResult::Stopped => return,
-                    TurnResult::SoftLimit(n) => {
-                        tracing::info!(channel_id = %msg.channel_id, turns = n, max = self.max_bot_turns, "soft bot turn limit reached");
-                        if msg.author.id != bot_id {
-                            let _ = msg.channel_id.say(
-                                &ctx.http,
-                                format!("⚠️ Bot turn limit reached ({n}/{}). A human must reply in this thread to continue bot-to-bot conversation.", self.max_bot_turns),
-                            ).await;
-                        }
-                        return;
-                    }
-                    TurnResult::Throttled => return,
-                    TurnResult::Ok => {}
                 }
             } else if matches!(msg.kind, MessageType::Regular | MessageType::InlineReply)
                 && !msg.content.is_empty()
@@ -360,26 +382,29 @@ impl EventHandler for Handler {
         }
 
         // Thread detection: single to_channel() call for both allowed and
-        // non-allowed channels. A message is "in a thread" when the channel
-        // type is a thread variant AND the parent is in the allowlist (or allow_all).
+        // non-allowed channels. Uses thread_metadata (not parent_id) to
+        // identify threads — see detect_thread() doc comments for rationale.
         let (in_thread, bot_owns_thread) = match msg.channel_id.to_channel(&ctx.http).await {
-            Ok(serenity::model::channel::Channel::Guild(gc))
-                if is_thread_channel(gc.kind) =>
-            {
-                // parent_id here points from thread → parent channel (not channel → category)
-                let parent_allowed = in_allowed_channel
-                    || self.allow_all_channels
-                    || gc.parent_id.is_some_and(|pid| self.allowed_channels.contains(&pid.get()));
-                let owned = gc.owner_id.is_some_and(|oid| oid == bot_id);
+            Ok(serenity::model::channel::Channel::Guild(gc)) => {
+                let result = detect_thread(
+                    gc.thread_metadata.is_some(),
+                    gc.parent_id.map(|id| id.get()),
+                    gc.owner_id.map(|id| id.get()),
+                    bot_id.get(),
+                    &self.allowed_channels,
+                    self.allow_all_channels,
+                    in_allowed_channel,
+                );
                 tracing::debug!(
                     channel_id = %msg.channel_id,
                     parent_id = ?gc.parent_id,
                     owner_id = ?gc.owner_id,
-                    parent_allowed,
-                    bot_owns = owned,
+                    has_thread_metadata = gc.thread_metadata.is_some(),
+                    in_thread = result.0,
+                    bot_owns = ?result.1,
                     "thread check"
                 );
-                (parent_allowed, owned)
+                (result.0, result.1.unwrap_or(false))
             }
             Ok(other) => {
                 tracing::debug!(channel_id = %msg.channel_id, kind = ?other, "not a guild thread");
@@ -565,11 +590,17 @@ impl EventHandler for Handler {
 
         let trigger_msg = discord_msg_ref(&msg);
 
+        // Per-thread streaming: check if another bot is present in this thread
+        let other_bot_present = {
+            let cache = self.multibot_threads.lock().await;
+            cache.contains_key(&msg.channel_id.to_string())
+        };
+
         let router = self.router.clone();
         tokio::spawn(async move {
             let sender_json = serde_json::to_string(&sender).unwrap();
             if let Err(e) = router
-                .handle_message(&adapter, &thread_channel, &sender_json, &prompt, extra_blocks, &trigger_msg)
+                .handle_message(&adapter, &thread_channel, &sender_json, &prompt, extra_blocks, &trigger_msg, other_bot_present)
                 .await
             {
                 error!("handle_message error: {e}");
@@ -794,6 +825,7 @@ async fn get_or_create_thread(
 ) -> anyhow::Result<ChannelRef> {
     let channel = msg.channel_id.to_channel(&ctx.http).await?;
     if let serenity::model::channel::Channel::Guild(ref gc) = channel {
+        // Already in a thread — reuse it. Uses thread_metadata (see detect_thread()).
         if gc.thread_metadata.is_some() {
             return Ok(ChannelRef {
                 platform: "discord".into(),
@@ -812,58 +844,50 @@ async fn get_or_create_thread(
         parent_id: None,
     };
     let trigger_ref = discord_msg_ref(msg);
-    adapter.create_thread(&parent, &trigger_ref, &thread_name).await
-}
-
-// --- Bot turn tracking ---
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum TurnResult {
-    /// Counter below limits — continue normally.
-    Ok,
-    /// Counter == soft_limit — warn once, then stop.
-    SoftLimit(u32),
-    /// Counter > soft_limit — silently stop (already warned).
-    Throttled,
-    /// Counter == HARD_BOT_TURN_LIMIT — warn once, then stop.
-    HardLimit,
-    /// Counter > HARD_BOT_TURN_LIMIT — silently stop (already warned).
-    Stopped,
-}
-
-pub(crate) struct BotTurnTracker {
-    soft_limit: u32,
-    counts: HashMap<String, (u32, u32)>,
-}
-
-impl BotTurnTracker {
-    pub fn new(soft_limit: u32) -> Self {
-        Self { soft_limit, counts: HashMap::new() }
-    }
-
-    pub fn on_bot_message(&mut self, thread_id: &str) -> TurnResult {
-        let (soft, hard) = self.counts.entry(thread_id.to_string()).or_insert((0, 0));
-        *soft += 1;
-        *hard += 1;
-        if *hard > HARD_BOT_TURN_LIMIT {
-            TurnResult::Stopped
-        } else if *hard == HARD_BOT_TURN_LIMIT {
-            TurnResult::HardLimit
-        } else if *soft > self.soft_limit {
-            TurnResult::Throttled
-        } else if *soft == self.soft_limit {
-            TurnResult::SoftLimit(*soft)
-        } else {
-            TurnResult::Ok
+    match adapter.create_thread(&parent, &trigger_ref, &thread_name).await {
+        Ok(ch) => Ok(ch),
+        Err(e) if is_thread_already_exists_error(&e) => {
+            // Another bot won the race from the same trigger message. Discord
+            // only allows one thread per message, so refetch the message and
+            // join the thread our sibling just created.
+            let refreshed = msg
+                .channel_id
+                .message(&ctx.http, msg.id)
+                .await
+                .map_err(|fe| anyhow::anyhow!(
+                    "thread_already_exists (race), but refetch failed: {fe}"
+                ))?;
+            let existing = refreshed.thread.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "thread_already_exists (race), but message has no thread after refetch"
+                )
+            })?;
+            tracing::info!(
+                channel_id = %msg.channel_id,
+                thread_id = %existing.id,
+                "joining thread created by sibling bot from same trigger message"
+            );
+            Ok(ChannelRef {
+                platform: "discord".into(),
+                channel_id: existing.id.to_string(),
+                thread_id: None,
+                parent_id: Some(msg.channel_id.get().to_string()),
+            })
         }
+        Err(e) => Err(e),
     }
+}
 
-    pub fn on_human_message(&mut self, thread_id: &str) {
-        if let Some((soft, hard)) = self.counts.get_mut(thread_id) {
-            *soft = 0;
-            *hard = 0;
-        }
-    }
+/// Detect Discord's "A thread has already been created for this message" error
+/// (JSON error code 160004). Triggered when two bots responding to the same
+/// @-mention race to create a thread from the same trigger message.
+///
+/// Uses string matching because serenity surfaces Discord API errors as
+/// formatted strings — there is no structured error code we can match on.
+/// Unit tests pin the expected patterns so serenity formatting changes are caught.
+fn is_thread_already_exists_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("160004") || msg.contains("already been created")
 }
 
 static ROLE_MENTION_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -881,10 +905,42 @@ fn resolve_mentions(content: &str, bot_id: UserId) -> String {
     out.trim().to_string()
 }
 
-/// Returns `true` if the given `ChannelType` is a Discord thread.
-/// Extracted for testability and to centralise thread detection logic.
-fn is_thread_channel(kind: ChannelType) -> bool {
-    matches!(kind, ChannelType::PublicThread | ChannelType::PrivateThread | ChannelType::NewsThread)
+/// Whether the Discord adapter should use streaming edit.
+/// Pure thread detection: determines whether a channel is a Discord thread
+/// in an allowed parent, and whether the bot owns it.
+///
+/// Returns `(in_allowed_thread, bot_owns)`:
+/// - `in_allowed_thread`: true only if the channel IS a thread AND its parent
+///   is permitted (via allowlist, `allow_all_channels`, or `in_allowed_channel`).
+/// - `bot_owns`: `None` if the channel is not a thread (ownership is meaningless);
+///   `Some(true/false)` if it IS a thread, indicating whether the bot owns it.
+///
+/// Uses `thread_metadata.is_some()` — the canonical way to identify threads.
+/// `parent_id` is NOT reliable for thread detection: category children also
+/// have `parent_id` set. `parent_id` is only used here for the allowlist check.
+///
+/// Discord API refs:
+/// - Channel Object (parent_id / thread_metadata fields):
+///   https://docs.discord.com/developers/resources/channel#channel-object
+/// - Thread Metadata ("thread-specific fields not needed by other channels"):
+///   https://docs.discord.com/developers/resources/channel#thread-metadata-object
+fn detect_thread(
+    has_thread_metadata: bool,
+    parent_id: Option<u64>,
+    owner_id: Option<u64>,
+    bot_id: u64,
+    allowed_channels: &HashSet<u64>,
+    allow_all_channels: bool,
+    in_allowed_channel: bool,
+) -> (bool, Option<bool>) {
+    if !has_thread_metadata {
+        return (false, None);
+    }
+    let in_allowed_thread = in_allowed_channel
+        || allow_all_channels
+        || parent_id.is_some_and(|pid| allowed_channels.contains(&pid));
+    let bot_owns = owner_id.is_some_and(|oid| oid == bot_id);
+    (in_allowed_thread, Some(bot_owns))
 }
 
 /// Pure decision function: should this message be processed or ignored?
@@ -916,123 +972,7 @@ fn should_process_user_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- Bot turn tracker tests ---
-
-    /// Basic increment: bot messages below the soft limit return Ok.
-    #[test]
-    fn bot_turns_increment() {
-        let mut t = BotTurnTracker::new(5);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-    }
-
-    /// Soft limit: after N consecutive bot turns, returns SoftLimit.
-    #[test]
-    fn soft_limit_triggers() {
-        let mut t = BotTurnTracker::new(3);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
-    }
-
-    /// Human message resets both soft and hard counters, allowing bots to continue.
-    #[test]
-    fn human_resets_both_counters() {
-        let mut t = BotTurnTracker::new(3);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        t.on_human_message("t1");
-        // Both reset — can do 2 more before soft limit
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
-    }
-
-    /// Hard limit: absolute cap on bot turns, triggers after HARD_BOT_TURN_LIMIT.
-    #[test]
-    fn hard_limit_triggers() {
-        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1);
-        for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
-            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        }
-        assert_eq!(t.on_bot_message("t1"), TurnResult::HardLimit);
-    }
-
-    /// Hard limit resets on human message, allowing bots to continue.
-    #[test]
-    fn hard_limit_resets_on_human() {
-        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1);
-        for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
-            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        }
-        t.on_human_message("t1");
-        // Hard counter reset — can go again
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-    }
-
-    /// When soft and hard limits are equal, hard limit takes precedence.
-    #[test]
-    fn hard_before_soft_when_equal() {
-        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT);
-        for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
-            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        }
-        // soft == hard == HARD_BOT_TURN_LIMIT → hard wins
-        assert_eq!(t.on_bot_message("t1"), TurnResult::HardLimit);
-    }
-
-    /// Turn counters are per-thread — one thread hitting the limit doesn't affect others.
-    #[test]
-    fn threads_are_independent() {
-        let mut t = BotTurnTracker::new(3);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
-        // t2 is unaffected
-        assert_eq!(t.on_bot_message("t2"), TurnResult::Ok);
-    }
-
-    /// Human message on an unknown thread is a no-op (should not panic).
-    #[test]
-    fn human_on_unknown_thread_is_noop() {
-        let mut t = BotTurnTracker::new(5);
-        t.on_human_message("unknown"); // should not panic
-    }
-
-    /// Two-bot ping-pong: both bots' messages count toward the same per-thread
-    /// limit. With soft_limit=20, the limit triggers after 20 total bot messages
-    /// (~10 per bot). This simulates what each bot's process sees when the
-    /// tracker runs before self-check — own messages are counted too. (#483)
-    #[test]
-    fn two_bot_pingpong_hits_soft_limit() {
-        let mut t = BotTurnTracker::new(20);
-        // Simulate 20 bot messages (alternating bot A and bot B,
-        // but the tracker doesn't distinguish — it just counts)
-        for i in 1..20 {
-            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok, "turn {i}");
-        }
-        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(20));
-    }
-
-    /// Human message in the middle of a ping-pong resets the counter,
-    /// allowing bots to continue.
-    #[test]
-    fn two_bot_pingpong_human_resets() {
-        let mut t = BotTurnTracker::new(20);
-        for _ in 0..15 {
-            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        }
-        t.on_human_message("t1"); // human intervenes at 15
-        for _ in 0..15 {
-            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok); // can do 15 more
-        }
-        // now at 15 again, 5 more to hit limit
-        for _ in 0..4 {
-            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        }
-        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(20));
-    }
+    use crate::bot_turns::{HARD_BOT_TURN_LIMIT, TurnResult};
 
     // --- resolve_mentions tests ---
 
@@ -1074,6 +1014,35 @@ mod tests {
         let bot_id = UserId::new(111);
         let result = resolve_mentions("<@111>", bot_id);
         assert_eq!(result, "");
+    }
+
+    // --- thread-race error detection ---
+
+    /// Detects the Discord error code for "thread already exists" (160004).
+    #[test]
+    fn is_thread_already_exists_matches_code() {
+        let err = anyhow::Error::msg(
+            r#"HTTP error: {"code": 160004, "message": "A thread has already been created for this message."}"#,
+        );
+        assert!(is_thread_already_exists_error(&err));
+    }
+
+    /// Detects the human-readable form of the error in case serenity renders
+    /// it without the numeric code.
+    #[test]
+    fn is_thread_already_exists_matches_message() {
+        let err = anyhow::anyhow!("A thread has already been created for this message.");
+        assert!(is_thread_already_exists_error(&err));
+    }
+
+    /// Unrelated errors do not match — we don't want the fallback path
+    /// swallowing real failures like permission denied.
+    #[test]
+    fn is_thread_already_exists_ignores_other_errors() {
+        let err = anyhow::anyhow!("Missing Permissions");
+        assert!(!is_thread_already_exists_error(&err));
+        let err = anyhow::anyhow!("rate limit exceeded");
+        assert!(!is_thread_already_exists_error(&err));
     }
 
     // --- should_process_user_message tests (GIVEN/WHEN/THEN) ---
@@ -1224,45 +1193,172 @@ mod tests {
         assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
     }
 
-    // --- is_thread_channel tests (regression for #518) ---
+    // --- detect_thread tests (regression for #506 → #518 → #519) ---
     // PR #506 used parent_id.is_some() to detect threads, but category text
     // channels also have parent_id (pointing to the category). This caused
     // the bot to skip thread creation for normal channels inside categories.
+    //
+    // detect_thread() uses thread_metadata.is_some() — the canonical check
+    // per Discord API docs. Table-driven to cover all channel scenarios.
 
-    /// Regression test for #518: a text channel inside a category has parent_id
-    /// set but is NOT a thread — is_thread_channel must return false.
-    #[test]
-    fn category_text_channel_is_not_thread() {
-        assert!(!is_thread_channel(ChannelType::Text));
+    const BOT: u64 = 1000;
+    const OTHER: u64 = 2000;
+    const PARENT_CH: u64 = 100;
+    const CATEGORY: u64 = 200;
+
+    /// Helper: build an allowed_channels set from a slice.
+    fn allowed(ids: &[u64]) -> HashSet<u64> {
+        ids.iter().copied().collect()
     }
 
-    /// Category channel itself is not a thread.
+    /// Table-driven: each row is a realistic Discord channel scenario.
     #[test]
-    fn category_channel_is_not_thread() {
-        assert!(!is_thread_channel(ChannelType::Category));
+    fn detect_thread_table() {
+        struct Case {
+            name: &'static str,
+            has_thread_metadata: bool,
+            parent_id: Option<u64>,
+            owner_id: Option<u64>,
+            bot_id: u64,
+            allowed_channels: HashSet<u64>,
+            allow_all: bool,
+            in_allowed: bool,
+            expect: (bool, Option<bool>), // (in_thread, bot_owns)
+        }
+
+        let cases = vec![
+            // --- Non-thread channels: thread_metadata = None ---
+            Case {
+                name: "text channel under category (regression #506)",
+                has_thread_metadata: false,
+                parent_id: Some(CATEGORY), // points to category, NOT a thread
+                owner_id: None,
+                bot_id: BOT,
+                allowed_channels: allowed(&[]),
+                allow_all: false,
+                in_allowed: true,
+                expect: (false, None),
+            },
+            Case {
+                name: "top-level text channel (no category)",
+                has_thread_metadata: false,
+                parent_id: None,
+                owner_id: None,
+                bot_id: BOT,
+                allowed_channels: allowed(&[]),
+                allow_all: false,
+                in_allowed: true,
+                expect: (false, None),
+            },
+            Case {
+                name: "voice channel under category",
+                has_thread_metadata: false,
+                parent_id: Some(CATEGORY),
+                owner_id: None,
+                bot_id: BOT,
+                allowed_channels: allowed(&[]),
+                allow_all: false,
+                in_allowed: false,
+                expect: (false, None),
+            },
+            // --- Thread channels: thread_metadata = Some ---
+            Case {
+                name: "public thread, parent in allowlist, bot owns",
+                has_thread_metadata: true,
+                parent_id: Some(PARENT_CH),
+                owner_id: Some(BOT),
+                bot_id: BOT,
+                allowed_channels: allowed(&[PARENT_CH]),
+                allow_all: false,
+                in_allowed: false,
+                expect: (true, Some(true)),
+            },
+            Case {
+                name: "public thread, parent in allowlist, other user owns",
+                has_thread_metadata: true,
+                parent_id: Some(PARENT_CH),
+                owner_id: Some(OTHER),
+                bot_id: BOT,
+                allowed_channels: allowed(&[PARENT_CH]),
+                allow_all: false,
+                in_allowed: false,
+                expect: (true, Some(false)),
+            },
+            Case {
+                name: "thread, parent NOT in allowlist, not allow_all",
+                has_thread_metadata: true,
+                parent_id: Some(PARENT_CH),
+                owner_id: Some(BOT),
+                bot_id: BOT,
+                allowed_channels: allowed(&[]),
+                allow_all: false,
+                in_allowed: false,
+                expect: (false, Some(true)),
+            },
+            Case {
+                name: "thread, allow_all_channels = true",
+                has_thread_metadata: true,
+                parent_id: Some(PARENT_CH),
+                owner_id: Some(OTHER),
+                bot_id: BOT,
+                allowed_channels: allowed(&[]),
+                allow_all: true,
+                in_allowed: false,
+                expect: (true, Some(false)),
+            },
+            Case {
+                name: "thread, in_allowed_channel = true (parent is the allowed channel)",
+                has_thread_metadata: true,
+                parent_id: Some(PARENT_CH),
+                owner_id: None,
+                bot_id: BOT,
+                allowed_channels: allowed(&[]),
+                allow_all: false,
+                in_allowed: true,
+                expect: (true, Some(false)),
+            },
+            // --- Defensive: partial data ---
+            Case {
+                name: "thread with parent_id = None (defensive, partial API data)",
+                has_thread_metadata: true,
+                parent_id: None,
+                owner_id: Some(BOT),
+                bot_id: BOT,
+                allowed_channels: allowed(&[PARENT_CH]),
+                allow_all: false,
+                in_allowed: false,
+                expect: (false, Some(true)), // can't verify parent → not allowed, but bot still owns
+            },
+        ];
+
+        for c in &cases {
+            let result = detect_thread(
+                c.has_thread_metadata,
+                c.parent_id,
+                c.owner_id,
+                c.bot_id,
+                &c.allowed_channels,
+                c.allow_all,
+                c.in_allowed,
+            );
+            assert_eq!(result, c.expect, "FAILED: {}", c.name);
+        }
     }
 
-    /// Voice channel is not a thread.
+    // --- Per-thread streaming tests (#534) ---
+    // Streaming ON by default, OFF when another bot is detected in the thread.
+
+    /// Single bot thread: streaming enabled.
     #[test]
-    fn voice_channel_is_not_thread() {
-        assert!(!is_thread_channel(ChannelType::Voice));
+    fn discord_streams_when_no_other_bot() {
+        let adapter = super::DiscordAdapter::new(Arc::new(super::Http::new("")));
+        assert!(adapter.use_streaming(false));
     }
 
-    /// PublicThread is correctly detected as a thread.
+    /// Multi-bot thread: send-once to avoid edit interference.
     #[test]
-    fn public_thread_is_thread() {
-        assert!(is_thread_channel(ChannelType::PublicThread));
-    }
-
-    /// PrivateThread is correctly detected as a thread.
-    #[test]
-    fn private_thread_is_thread() {
-        assert!(is_thread_channel(ChannelType::PrivateThread));
-    }
-
-    /// NewsThread is correctly detected as a thread.
-    #[test]
-    fn news_thread_is_thread() {
-        assert!(is_thread_channel(ChannelType::NewsThread));
+    fn discord_no_stream_when_other_bot_present() {
+        let adapter = super::DiscordAdapter::new(Arc::new(super::Http::new("")));
+        assert!(!adapter.use_streaming(true));
     }
 }

@@ -1,5 +1,6 @@
 mod acp;
 mod adapter;
+mod bot_turns;
 mod config;
 mod discord;
 mod error_display;
@@ -9,6 +10,7 @@ mod reactions;
 mod setup;
 mod slack;
 mod stt;
+mod gateway;
 
 use adapter::AdapterRouter;
 use clap::Parser;
@@ -30,7 +32,8 @@ struct Cli {
 enum Commands {
     /// Run the bot (default)
     Run {
-        /// Config file path (default: config.toml)
+        /// Config file path or URL (default: config.toml)
+        #[arg(short = 'c', long = "config", value_name = "CONFIG")]
         config: Option<String>,
     },
     /// Launch the interactive setup wizard
@@ -52,185 +55,212 @@ async fn main() -> anyhow::Result<()> {
 
     let cmd = Cli::parse().command.unwrap_or(Commands::Run { config: None });
 
-    match cmd {
+    let config_arg = match cmd {
         Commands::Setup { output } => {
             setup::run_setup(output.map(PathBuf::from))?;
-            Ok(())
+            return Ok(());
         }
-        Commands::Run { config } => {
-            let config_path = config
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("config.toml"));
+        Commands::Run { config } => config,
+    };
 
-            let mut cfg = config::load_config(&config_path)?;
-            info!(
-                agent_cmd = %cfg.agent.command,
-                pool_max = cfg.pool.max_sessions,
-                discord = cfg.discord.is_some(),
-                slack = cfg.slack.is_some(),
-                reactions = cfg.reactions.enabled,
-                "config loaded"
-            );
+    // -- Run path --
+    let config_source = config_arg.unwrap_or_else(|| "config.toml".into());
 
-            if cfg.discord.is_none() && cfg.slack.is_none() {
-                anyhow::bail!("no adapter configured — add [discord] and/or [slack] to config.toml");
-            }
+    let mut cfg = if config_source.starts_with("https://") {
+        info!(url = %config_source, "fetching remote config");
+        config::load_config_from_url(&config_source).await?
+    } else if config_source.starts_with("http://") {
+        warn!(url = %config_source, "fetching remote config over plaintext HTTP — use HTTPS in production");
+        config::load_config_from_url(&config_source).await?
+    } else {
+        config::load_config(&PathBuf::from(&config_source))?
+    };
+    info!(
+        agent_cmd = %cfg.agent.command,
+        pool_max = cfg.pool.max_sessions,
+        discord = cfg.discord.is_some(),
+        slack = cfg.slack.is_some(),
+        reactions = cfg.reactions.enabled,
+        "config loaded"
+    );
 
-            let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
-            let ttl_secs = cfg.pool.session_ttl_hours * 3600;
-
-            // Resolve STT config (auto-detect GROQ_API_KEY from env)
-            if cfg.stt.enabled {
-                if cfg.stt.api_key.is_empty() && cfg.stt.base_url.contains("groq.com") {
-                    if let Ok(key) = std::env::var("GROQ_API_KEY") {
-                        if !key.is_empty() {
-                            info!("stt.api_key not set, using GROQ_API_KEY from environment");
-                            cfg.stt.api_key = key;
-                        }
-                    }
-                }
-                if cfg.stt.api_key.is_empty() {
-                    anyhow::bail!("stt.enabled = true but no API key found — set stt.api_key in config or export GROQ_API_KEY");
-                }
-                info!(model = %cfg.stt.model, base_url = %cfg.stt.base_url, "STT enabled");
-            }
-
-            let router = Arc::new(AdapterRouter::new(pool.clone(), cfg.reactions));
-
-            // Shutdown signal for Slack adapter
-            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
-            // Spawn cleanup task
-            let cleanup_pool = pool.clone();
-            let cleanup_handle = tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                    cleanup_pool.cleanup_idle(ttl_secs).await;
-                }
-            });
-
-            // Spawn Slack adapter (background task)
-            let slack_handle = if let Some(slack_cfg) = cfg.slack {
-                let allow_all_channels = config::resolve_allow_all(slack_cfg.allow_all_channels, &slack_cfg.allowed_channels);
-                let allow_all_users = config::resolve_allow_all(slack_cfg.allow_all_users, &slack_cfg.allowed_users);
-                if !allow_all_channels && slack_cfg.allowed_channels.is_empty() {
-                    warn!("allow_all_channels=false with empty allowed_channels for Slack — bot will deny all channels");
-                }
-                info!(
-                    allow_all_channels,
-                    allow_all_users,
-                    channels = slack_cfg.allowed_channels.len(),
-                    users = slack_cfg.allowed_users.len(),
-                    allow_bot_messages = ?slack_cfg.allow_bot_messages,
-                    allow_user_messages = ?slack_cfg.allow_user_messages,
-                    "starting slack adapter"
-                );
-                let router = router.clone();
-                let stt = cfg.stt.clone();
-                let session_ttl = std::time::Duration::from_secs(ttl_secs);
-                Some(tokio::spawn(async move {
-                    if let Err(e) = slack::run_slack_adapter(
-                        slack_cfg.bot_token,
-                        slack_cfg.app_token,
-                        allow_all_channels,
-                        allow_all_users,
-                        slack_cfg.allowed_channels.into_iter().collect(),
-                        slack_cfg.allowed_users.into_iter().collect(),
-                        slack_cfg.allow_bot_messages,
-                        slack_cfg.trusted_bot_ids.into_iter().collect(),
-                        slack_cfg.allow_user_messages,
-                        session_ttl,
-                        stt,
-                        router,
-                        shutdown_rx,
-                    )
-                    .await
-                    {
-                        error!("slack adapter error: {e}");
-                    }
-                }))
-            } else {
-                None
-            };
-
-            // Run Discord adapter (foreground, blocking) or wait for ctrl_c
-            if let Some(discord_cfg) = cfg.discord {
-                let allow_all_channels = config::resolve_allow_all(discord_cfg.allow_all_channels, &discord_cfg.allowed_channels);
-                let allow_all_users = config::resolve_allow_all(discord_cfg.allow_all_users, &discord_cfg.allowed_users);
-                let allowed_channels =
-                    parse_id_set(&discord_cfg.allowed_channels, "discord.allowed_channels")?;
-                if !allow_all_channels && allowed_channels.is_empty() {
-                    warn!("allow_all_channels=false with empty allowed_channels for Discord — bot will deny all channels");
-                }
-                let allowed_users = parse_id_set(&discord_cfg.allowed_users, "discord.allowed_users")?;
-                let trusted_bot_ids = parse_id_set(&discord_cfg.trusted_bot_ids, "discord.trusted_bot_ids")?;
-                info!(
-                    allow_all_channels,
-                    allow_all_users,
-                    channels = allowed_channels.len(),
-                    users = allowed_users.len(),
-                    trusted_bots = trusted_bot_ids.len(),
-                    allow_bot_messages = ?discord_cfg.allow_bot_messages,
-                    allow_user_messages = ?discord_cfg.allow_user_messages,
-                    "starting discord adapter"
-                );
-
-                let handler = discord::Handler {
-                    router,
-                    allow_all_channels,
-                    allow_all_users,
-                    allowed_channels,
-                    allowed_users,
-                    stt_config: cfg.stt.clone(),
-                    adapter: std::sync::OnceLock::new(),
-                    allow_bot_messages: discord_cfg.allow_bot_messages,
-                    trusted_bot_ids,
-                    allow_user_messages: discord_cfg.allow_user_messages,
-                    participated_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-                    multibot_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-                    session_ttl: std::time::Duration::from_secs(ttl_secs),
-                    max_bot_turns: discord_cfg.max_bot_turns,
-                    bot_turns: tokio::sync::Mutex::new(discord::BotTurnTracker::new(discord_cfg.max_bot_turns)),
-                };
-
-                let intents = GatewayIntents::GUILD_MESSAGES
-                    | GatewayIntents::MESSAGE_CONTENT
-                    | GatewayIntents::GUILDS;
-
-                let mut client = Client::builder(&discord_cfg.bot_token, intents)
-                    .event_handler(handler)
-                    .await?;
-
-                // Graceful Discord shutdown on ctrl_c
-                let shard_manager = client.shard_manager.clone();
-                tokio::spawn(async move {
-                    tokio::signal::ctrl_c().await.ok();
-                    info!("shutdown signal received");
-                    shard_manager.shutdown_all().await;
-                });
-
-                info!("discord bot running");
-                client.start().await?;
-            } else {
-                // No Discord — just wait for ctrl_c
-                info!("running without discord, press ctrl+c to stop");
-                tokio::signal::ctrl_c().await.ok();
-                info!("shutdown signal received");
-            }
-
-            // Cleanup
-            cleanup_handle.abort();
-            // Signal Slack adapter to shut down gracefully
-            let _ = shutdown_tx.send(true);
-            if let Some(handle) = slack_handle {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
-            }
-            let shutdown_pool = pool;
-            shutdown_pool.shutdown().await;
-            info!("openab shut down");
-            Ok(())
-        }
+    if cfg.discord.is_none() && cfg.slack.is_none() && cfg.gateway.is_none() {
+        anyhow::bail!("no adapter configured — add [discord], [slack], and/or [gateway] to config.toml");
     }
+
+    let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
+    let ttl_secs = cfg.pool.session_ttl_hours * 3600;
+
+    // Resolve STT config (auto-detect GROQ_API_KEY from env)
+    if cfg.stt.enabled {
+        if cfg.stt.api_key.is_empty() && cfg.stt.base_url.contains("groq.com") {
+            if let Ok(key) = std::env::var("GROQ_API_KEY") {
+                if !key.is_empty() {
+                    info!("stt.api_key not set, using GROQ_API_KEY from environment");
+                    cfg.stt.api_key = key;
+                }
+            }
+        }
+        if cfg.stt.api_key.is_empty() {
+            anyhow::bail!("stt.enabled = true but no API key found — set stt.api_key in config or export GROQ_API_KEY");
+        }
+        info!(model = %cfg.stt.model, base_url = %cfg.stt.base_url, "STT enabled");
+    }
+
+    let router = Arc::new(AdapterRouter::new(pool.clone(), cfg.reactions));
+
+    // Shutdown signal for Slack adapter
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Spawn cleanup task
+    let cleanup_pool = pool.clone();
+    let cleanup_handle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            cleanup_pool.cleanup_idle(ttl_secs).await;
+        }
+    });
+
+    // Spawn Slack adapter (background task)
+    let slack_handle = if let Some(slack_cfg) = cfg.slack {
+        let allow_all_channels = config::resolve_allow_all(slack_cfg.allow_all_channels, &slack_cfg.allowed_channels);
+        let allow_all_users = config::resolve_allow_all(slack_cfg.allow_all_users, &slack_cfg.allowed_users);
+        if !allow_all_channels && slack_cfg.allowed_channels.is_empty() {
+            warn!("allow_all_channels=false with empty allowed_channels for Slack — bot will deny all channels");
+        }
+        info!(
+            allow_all_channels,
+            allow_all_users,
+            channels = slack_cfg.allowed_channels.len(),
+            users = slack_cfg.allowed_users.len(),
+            allow_bot_messages = ?slack_cfg.allow_bot_messages,
+            allow_user_messages = ?slack_cfg.allow_user_messages,
+            "starting slack adapter"
+        );
+        let router = router.clone();
+        let stt = cfg.stt.clone();
+        let session_ttl = std::time::Duration::from_secs(ttl_secs);
+        let max_bot_turns = slack_cfg.max_bot_turns;
+        let slack_shutdown_rx = shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = slack::run_slack_adapter(
+                slack_cfg.bot_token,
+                slack_cfg.app_token,
+                allow_all_channels,
+                allow_all_users,
+                slack_cfg.allowed_channels.into_iter().collect(),
+                slack_cfg.allowed_users.into_iter().collect(),
+                slack_cfg.allow_bot_messages,
+                slack_cfg.trusted_bot_ids.into_iter().collect(),
+                slack_cfg.allow_user_messages,
+                max_bot_turns,
+                session_ttl,
+                stt,
+                router,
+                slack_shutdown_rx,
+            )
+            .await
+            {
+                error!("slack adapter error: {e}");
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Spawn Gateway adapter (background task)
+    let gateway_handle = if let Some(gw_cfg) = cfg.gateway {
+        let router = router.clone();
+        let shutdown_rx = shutdown_rx.clone();
+        info!(url = %gw_cfg.url, "starting gateway adapter");
+        Some(tokio::spawn(async move {
+            if let Err(e) = gateway::run_gateway_adapter(gw_cfg.url, gw_cfg.platform, gw_cfg.token, gw_cfg.bot_username, router, shutdown_rx).await {
+                error!("gateway adapter error: {e}");
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Run Discord adapter (foreground, blocking) or wait for ctrl_c
+    if let Some(discord_cfg) = cfg.discord {
+        let allow_all_channels = config::resolve_allow_all(discord_cfg.allow_all_channels, &discord_cfg.allowed_channels);
+        let allow_all_users = config::resolve_allow_all(discord_cfg.allow_all_users, &discord_cfg.allowed_users);
+        let allowed_channels =
+            parse_id_set(&discord_cfg.allowed_channels, "discord.allowed_channels")?;
+        if !allow_all_channels && allowed_channels.is_empty() {
+            warn!("allow_all_channels=false with empty allowed_channels for Discord — bot will deny all channels");
+        }
+        let allowed_users = parse_id_set(&discord_cfg.allowed_users, "discord.allowed_users")?;
+        let trusted_bot_ids = parse_id_set(&discord_cfg.trusted_bot_ids, "discord.trusted_bot_ids")?;
+        info!(
+            allow_all_channels,
+            allow_all_users,
+            channels = allowed_channels.len(),
+            users = allowed_users.len(),
+            trusted_bots = trusted_bot_ids.len(),
+            allow_bot_messages = ?discord_cfg.allow_bot_messages,
+            allow_user_messages = ?discord_cfg.allow_user_messages,
+            "starting discord adapter"
+        );
+
+        let handler = discord::Handler {
+            router,
+            allow_all_channels,
+            allow_all_users,
+            allowed_channels,
+            allowed_users,
+            stt_config: cfg.stt.clone(),
+            adapter: std::sync::OnceLock::new(),
+            allow_bot_messages: discord_cfg.allow_bot_messages,
+            trusted_bot_ids,
+            allow_user_messages: discord_cfg.allow_user_messages,
+            participated_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            multibot_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            session_ttl: std::time::Duration::from_secs(ttl_secs),
+            max_bot_turns: discord_cfg.max_bot_turns,
+            bot_turns: tokio::sync::Mutex::new(bot_turns::BotTurnTracker::new(discord_cfg.max_bot_turns)),
+        };
+
+        let intents = GatewayIntents::GUILD_MESSAGES
+            | GatewayIntents::MESSAGE_CONTENT
+            | GatewayIntents::GUILDS;
+
+        let mut client = Client::builder(&discord_cfg.bot_token, intents)
+            .event_handler(handler)
+            .await?;
+
+        // Graceful Discord shutdown on ctrl_c
+        let shard_manager = client.shard_manager.clone();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            info!("shutdown signal received");
+            shard_manager.shutdown_all().await;
+        });
+
+        info!("discord bot running");
+        client.start().await?;
+    } else {
+        // No Discord — just wait for ctrl_c
+        info!("running without discord, press ctrl+c to stop");
+        tokio::signal::ctrl_c().await.ok();
+        info!("shutdown signal received");
+    }
+
+    // Cleanup
+    cleanup_handle.abort();
+    // Signal Slack adapter to shut down gracefully
+    let _ = shutdown_tx.send(true);
+    if let Some(handle) = slack_handle {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+    if let Some(handle) = gateway_handle {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+    let shutdown_pool = pool;
+    shutdown_pool.shutdown().await;
+    info!("openab shut down");
+    Ok(())
 }
 
 fn parse_id_set(raw: &[String], label: &str) -> anyhow::Result<HashSet<u64>> {
@@ -250,4 +280,58 @@ fn parse_id_set(raw: &[String], label: &str) -> anyhow::Result<HashSet<u64>> {
         );
     }
     Ok(set)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn cli_no_args_defaults_to_run() {
+        let cli = Cli::try_parse_from(["openab"]).unwrap();
+        assert!(cli.command.is_none()); // None → unwrap_or(Run { config: None })
+    }
+
+    #[test]
+    fn cli_run_no_args_defaults_config() {
+        let cli = Cli::try_parse_from(["openab", "run"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Run { config } => assert!(config.is_none()),
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn cli_run_with_short_flag_local() {
+        let cli = Cli::try_parse_from(["openab", "run", "-c", "my-config.toml"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Run { config } => assert_eq!(config.unwrap(), "my-config.toml"),
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn cli_run_with_long_flag_local() {
+        let cli = Cli::try_parse_from(["openab", "run", "--config", "my-config.toml"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Run { config } => assert_eq!(config.unwrap(), "my-config.toml"),
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn cli_run_with_remote_url() {
+        let cli = Cli::try_parse_from(["openab", "run", "-c", "https://example.com/config.toml"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Run { config } => assert!(config.unwrap().starts_with("https://")),
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn cli_setup_subcommand() {
+        let cli = Cli::try_parse_from(["openab", "setup"]).unwrap();
+        assert!(matches!(cli.command.unwrap(), Commands::Setup { .. }));
+    }
 }

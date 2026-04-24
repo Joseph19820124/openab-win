@@ -61,6 +61,8 @@ Complete guide to setting up, configuring, and running OpenAB with Discord.
 
 ## Configuration Reference
 
+> 📖 Full config options with defaults: [docs/config-reference.md](config-reference.md#discord)
+
 ```toml
 [discord]
 bot_token = "${DISCORD_BOT_TOKEN}"
@@ -165,6 +167,23 @@ When you @mention the bot in a channel, it creates a **thread** from your messag
 - **`mentions` mode:** @mention required for every message, even in threads
 
 Each thread gets its own agent session. Sessions are cleaned up after `session_ttl_hours` (default: 24h).
+
+---
+
+## Streaming
+
+OpenAB uses **edit-streaming** on Discord — the bot sends a placeholder message and updates it every 1.5 seconds as tokens arrive, giving a live typing effect.
+
+Streaming is decided **per-thread**, not globally:
+
+| Thread state | Streaming |
+|---|---|
+| Single bot + human | ✅ ON — live edit updates |
+| 2+ bots in thread | ❌ OFF — send-once to avoid edit interference |
+
+When a second bot posts in a thread, streaming automatically switches off for that thread. This prevents multiple bots from editing placeholder messages simultaneously, which causes visual glitches on Discord.
+
+No configuration needed — this is automatic based on multibot detection.
 
 ---
 

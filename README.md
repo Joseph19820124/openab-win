@@ -10,7 +10,7 @@
 
 ![OpenAB banner](images/banner.jpg)
 
-A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, Copilot CLI, etc.) over stdio JSON-RPC — delivering the next-generation development experience.
+A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, Copilot CLI, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE**, and other webhook-based platforms are supported via the standalone [Custom Gateway](gateway/).
 
 🪼 **Join our community!** Come say hi on Discord — we'd love to have you: **[🪼 OpenAB — Official](https://discord.gg/YNksK9M6)** 🎉
 
@@ -20,8 +20,15 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 │   User       │               │    openab    │◄── JSON-RPC ──│  (acp mode)  │
 ├──────────────┤  Socket Mode  │    (Rust)    │               └──────────────┘
 │   Slack      │◄─────────────►│              │
-│   User       │               └──────────────┘
-└──────────────┘
+│   User       │               └──────┬───────┘
+├──────────────┤                      │ WebSocket (outbound)
+│   Telegram   │◄──webhook──┐         │
+│   User       │            │         │
+├──────────────┤            ▼         ▼
+│   LINE       │◄──webhook──┌──────────────────┐
+│   User       │            │  Custom Gateway  │
+└──────────────┘            │  (standalone)    │
+                            └──────────────────┘
 ```
 
 ## Demo
@@ -56,6 +63,20 @@ See [docs/discord.md](docs/discord.md) for a detailed step-by-step guide.
 <summary><strong>Slack</strong></summary>
 
 See [docs/slack-bot-howto.md](docs/slack-bot-howto.md) for a detailed step-by-step guide.
+
+</details>
+
+<details>
+<summary><strong>Telegram</strong> (via Custom Gateway)</summary>
+
+See [docs/telegram.md](docs/telegram.md) for the full setup guide. Requires the standalone [Custom Gateway](gateway/) service.
+
+</details>
+
+<details>
+<summary><strong>LINE</strong> (via Custom Gateway)</summary>
+
+See [docs/line.md](docs/line.md) for the full setup guide. Requires the standalone [Custom Gateway](gateway/) service.
 
 </details>
 
@@ -162,7 +183,30 @@ shared Tokyo EC2 running `codex-acp`. See
 walkthrough (EC2 setup, `~/.ssh/config`, `config.toml` example,
 latency expectations, troubleshooting).
 
+### Remote Config
+
+Config can be loaded from a local file or a remote URL via the `--config` / `-c` flag:
+
+```bash
+# Local file
+openab run --config config.toml
+openab run -c config.toml
+
+# Remote URL (http:// or https://)
+openab run --config https://example.com/config.toml
+openab run -c https://example.com/config.toml
+
+# Default (no flag → config.toml)
+openab run
+```
+
+This is useful for containerized or multi-node deployments where config is hosted on a central server (e.g. S3, Git raw URL, internal HTTP service).
+
+> **Security best practice:** Never hardcode secrets in remote config files. Use environment variable references like `bot_token = "${DISCORD_BOT_TOKEN}"` and inject the actual values via local environment variables or Kubernetes Secrets. OpenAB expands `${VAR}` identically for both local and remote config.
+
 ## Configuration Reference
+
+> 📖 Full reference with all options, defaults, and Helm mapping: [docs/config-reference.md](docs/config-reference.md)
 
 ```toml
 [discord]
