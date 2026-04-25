@@ -80,7 +80,7 @@ working_dir = "."  # use local project dir; set "/home/agent" in containers
 # (EC2 provisioning, SSH ControlMaster multiplexing, auth).
 # [agent]
 # command = "ssh"
-# args = ["-tt", "tokyo-agent", "gemini", "--acp"]  # Host alias from ~/.ssh/config
+# args = ["-T", "tokyo-agent", "gemini", "--acp"]  # -T disables TTY (required for JSON-RPC stdio)
 # working_dir = "."
 # env = {}  # Set GEMINI_API_KEY in the remote ~/.bashrc, not here
 
